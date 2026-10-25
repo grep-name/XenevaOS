@@ -475,7 +475,7 @@ run_build_tui() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --llvm) TOOLCHAIN=llvm ;;
+        --llvm|llvm) TOOLCHAIN=llvm ;;
         --gcc) TOOLCHAIN=gcc ;;
         --skip-build) SKIP_BUILD=1 ;;
         --force-user-apps) BUILD_USER_APPS=1 ;;
