@@ -956,6 +956,12 @@ typedef UINTN  *BASE_LIST;
   @return  The absolute value of the signed operand.
 
 **/
+
+// undefine abs defined in stdint.h it gets overwritten anyway
+#ifdef ABS
+#undef ABS
+#endif
+
 #define ABS(a)                          \
   (((a) < 0) ? (-(a)) : (a))
 
