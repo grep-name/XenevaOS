@@ -28,7 +28,7 @@ v sudo pacman -Syu --noconfirm
 v sudo pacman -S --needed --noconfirm make
 v sudo pacman -S --needed --noconfirm dosfstools
 v sudo pacman -S --needed --noconfirm mtools
-v sudo pacman -S --needed --noconfirm qemu-system-aarch64
+v sudo pacman -S --needed --noconfirm qemu-full
 v sudo pacman -S --needed --noconfirm edk2-aarch64
 
 case $2 in
