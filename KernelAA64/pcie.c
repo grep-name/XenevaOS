@@ -45,6 +45,7 @@
 #define QEMU_VIRT_ECAM_BASE 0x3f000000
 
 static uint64_t _ecamAddress;
+static uint32_t _ecamBuses;	/* ECAM window size in 1 MiB bus strides, 0 = unknown */
 static bool _pcieInitialized;
 
 static int _pcie_check_and_map_dtb() {
@@ -68,6 +69,9 @@ static int _pcie_check_and_map_dtb() {
 	if (ecamAddr != 0)
 		_ecamAddress = (uint64_t)AuMapMMIO(ecamAddr, 0x10000);
 
+	/* the reg's size cell: the window the scan is allowed to walk */
+	_ecamBuses = (uint32_t)(sizeValue >> 20);
+
 	_pcieInitialized = 1;
 #endif
 	return 0;
@@ -77,6 +81,13 @@ static bool _pcie_use_hard_code_ecam() {
 	AuTextOut("[aurora]: pcie getting hard code ecam address \r\n");
 #ifdef __TARGET_BOARD_QEMU_VIRT__
 	_ecamAddress = (uint64_t)AuMapMMIO(QEMU_VIRT_ECAM_BASE, 0x10000000 / 0x1000);
+	/*
+	 * mach-virt's pcie-mmcfg-mmio is a 256 MiB container, but only the
+	 * first 16 MiB are aliased into the physical map (0x3f000000 to
+	 * 0x3fffffff); 0x40000000 is RAM. Sixteen is the window, highmem=off
+	 * being the base this hard code names.
+	 */
+	_ecamBuses = 0x1000000 >> 20;
 #elif __TARGET_BOARD_RPI3__
 	_ecamAddress = 0;
 #elif __TARGET_BOARD_IMX8MP_VERDIN_DAHLIA__
@@ -128,6 +139,16 @@ void AA64PCIeInitialize() {
 
 bool AuIsPCIeInitialized() {
 	return _pcieInitialized;
+}
+
+/*
+ * AuPCIEBusCount -- how many bus numbers the located ECAM window actually
+ * covers, counted in the 1 MiB stride ECAM uses per bus. Zero means the
+ * window is unknown -- the ACPI path sets no size -- and a caller falls
+ * back to its own ceiling.
+ */
+int AuPCIEBusCount() {
+	return (int)_ecamBuses;
 }
 
 /**
@@ -614,11 +635,19 @@ bool AuPCIEAllocMSI(uint64_t device, size_t vector, int bus, int dev, int func) 
 				uint8_t pba_bir = pbaOffset & 0x7;
 				size_t barsz = 0;
 				uint64_t msi_bar = AuPCIEReadBAR(device, bus, dev, func, table_bir, &barsz);
-				uint64_t mappedMsiBar = (uint64_t)AuMapMMIO(msi_bar, 1);
 				uint64_t tablecount = (msixctl & 0x7ff) + 1;
+				uint32_t offset = tableOffset & ~0x7;
+				/* The table can sit past the first BAR page (qemu-xhci
+				 * puts it at 0x3000), so map through its last entry
+				 * instead of faulting on the next page. */
+				size_t table_pages = (offset + tablecount * 16 + 0xfff) >> 12;
+				if (barsz && table_pages > (barsz >> 12))
+					table_pages = barsz >> 12;
+				if (!table_pages)
+					table_pages = 1;
+				uint64_t mappedMsiBar = (uint64_t)AuMapMMIO(msi_bar, table_pages);
 				uint64_t msi_address = AuGICGetMSIAddress((int)vector);
 				uint32_t msi_data = AuGICGetMSIData((int)vector);
-				uint32_t offset = tableOffset & ~0x7;
 				volatile uint32_t* msitab = RAW_OFFSET(volatile uint32_t*, mappedMsiBar, offset);
 				for (int n = 0; n < tablecount; ++n) {
 					msitab[0 + 4 * n] = (uint32_t)msi_address;

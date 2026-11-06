@@ -53,7 +53,12 @@
 #include <proctoken.h>
 #include <Fs/pipe.h>
 #include <power.h>
+#include <Log/_print.h>
+#include <Log/klog.h>
 #include <timer.h>
+#include <bordoisila_ptr.h>
+#include <Sync/poll.h>
+#include <Fs/vfsmod.h>
 
 AA64Registers* svcCurrentRegs;
 
@@ -76,6 +81,39 @@ extern uint64_t read_sp();
 uint64_t test_call() {
 	UARTDebugOut("Test call initiated \r\n");
 	return 100;
+}
+
+#define _UTSNAME_LENGTH 256
+
+struct utsname {
+	char sysname[_UTSNAME_LENGTH];
+	char nodename[_UTSNAME_LENGTH];
+	char release[_UTSNAME_LENGTH];
+	char version[_UTSNAME_LENGTH];
+	char machine[_UTSNAME_LENGTH];
+	char domainname[_UTSNAME_LENGTH];
+};
+
+/**
+ * @brief ExecUname -- uname system call
+ * @param name -- Pointer to user space utsname structure
+ */
+int ExecUname(struct utsname* name) {
+	if (!name)
+		return 1;
+	if (!__BORDOISILA_UBUF_VALIDATE(name, sizeof(struct utsname))) {
+		UARTDebugOut("ExecUname system call, invalid user buffer : %x \r\n", name);
+		return 1;
+	}
+	//check for pointer validation of name
+	strcpy(name->sysname, XENEVA_OS_NAME);
+	strcpy(name->nodename, XENEVA_OS_NODENAME);
+	strcpy(name->release, XENEVA_KERNEL_RELEASE);
+	strcpy(name->version,
+		   XENEVA_KERNEL_VERSION " #" XENEVA_KERNEL_BUILD " " XENEVA_KERNEL_BUILD_TAG);
+	strcpy(name->machine, XENEVA_KERNEL_MACHINE);
+	strcpy(name->domainname, " ");
+	return 0;
 }
 
 AA64Registers* AA64GetCurrentRegCtx() {
@@ -133,10 +171,24 @@ static void* syscalls[AURORA_MAX_SYSCALL] = {
 	[SYS_NET_CONNECT] = NetConnect,
 	[SYS_NET_SEND] = NetSend,
 	[SYS_NET_RECEIVE] = NetReceive,
-	[SYS_SOCKET_SET_OPT] = AuSocketSetOpt,
+	[SYS_SOCKET_SET_OPT] = NetSocketSetOpt,
 	[SYS_NET_BIND] = NetBind,
 	[SYS_NET_ACCEPT] = NetAccept,
 	[SYS_NET_LISTEN] = NetListen,
+	[SYS_SOCKETPAIR] = NetSocketPair,
+	[SYS_GETSOCKOPT] = NetGetSockOpt,
+	[SYS_GETSOCKNAME] = NetGetSockName,
+	[SYS_GETPEERNAME] = NetGetPeerName,
+	[SYS_SHUTDOWN] = NetShutdown,
+	[SYS_SENDMMSG] = NetSendMmsg,
+	[SYS_RECVMMSG] = NetRecvMmsg,
+	[SYS_ACCEPT4] = NetAccept4,
+	[SYS_SENDTO] = NetSendTo,
+	[SYS_RECVFROM] = NetRecvFrom,
+	[SYS_IF_NAMETOINDEX] = NetIfNameToIndex,
+	[SYS_GETIFADDRS] = NetGetIfAddrs,
+	[SYS_VFS_MOUNT] = VFSMount,
+	[SYS_VFS_UNMOUNT] = VFSUnmount,
 	[SYS_CREATE_PIPE] = AuCreatePipe,
 	[SYS_GET_VDISK_INFO] = AuGetVDiskInfo,
 	[SYS_GET_VDISK_PARTITION_INFO] = AuGetVDiskPartitionInfo,
@@ -165,6 +217,10 @@ static void* syscalls[AURORA_MAX_SYSCALL] = {
 	[SYS_EXIT_SUB_THREAD] = ExitSubThread,
 	[SYS_SEND_SIGNAL_TO_THREAD] = SendSignalToThread,
 	[SYS_THREAD_WAIT_FOR_TERMINATION] = AuThreadWaitForTermination,
+	[SYS_KERNEL_UNAME] = ExecUname,
+	[SYS_FILE_POLL] = AuPoll,
+	[SYS_FILE_CHMOD] = Chmod,
+	[SYS_FILE_FSYS_OWN] = AuVFSOwnFsys,
 };
 
 #ifdef __KERNEL_PROFILER_ON__
@@ -219,10 +275,24 @@ static char* syscall_name[AURORA_MAX_SYSCALL] = {
 	[SYS_NET_CONNECT] = "NetConnect",
 	[SYS_NET_SEND] = "NetSend",
 	[SYS_NET_RECEIVE] = "NetReceive",
-	[SYS_SOCKET_SET_OPT] = "AuSocketSetOpt",
+	[SYS_SOCKET_SET_OPT] = "NetSocketSetOpt",
 	[SYS_NET_BIND] = "NetBind",
 	[SYS_NET_ACCEPT] = "NetAccept",
 	[SYS_NET_LISTEN] = "NetListen",
+	[SYS_SOCKETPAIR] = "NetSocketPair",
+	[SYS_GETSOCKOPT] = "NetGetSockOpt",
+	[SYS_GETSOCKNAME] = "NetGetSockName",
+	[SYS_GETPEERNAME] = "NetGetPeerName",
+	[SYS_SHUTDOWN] = "NetShutdown",
+	[SYS_SENDMMSG] = "NetSendMmsg",
+	[SYS_RECVMMSG] = "NetRecvMmsg",
+	[SYS_ACCEPT4] = "NetAccept4",
+	[SYS_SENDTO] = "NetSendTo",
+	[SYS_RECVFROM] = "NetRecvFrom",
+	[SYS_IF_NAMETOINDEX] = "NetIfNameToIndex",
+	[SYS_GETIFADDRS] = "NetGetIfAddrs",
+	[SYS_VFS_MOUNT] = "VFSMount",
+	[SYS_VFS_UNMOUNT] = "VFSUnmount",
 	[SYS_CREATE_PIPE] = "AuCreatePipe",
 	[SYS_GET_VDISK_INFO] = "AuGetVDiskInfo",
 	[SYS_GET_VDISK_PARTITION_INFO] = "AuGetVDiskPartitionInfo",
@@ -258,13 +328,16 @@ extern void modifyx17();
  * @brief AuAA64SyscalHandler -- common system call handler for aarch64
  * @param regs -- Register information passed by sync_exception
  */
-int64_t AuLinuxSyscall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-						uint64_t a5);
+int64_t AuLinuxSyscall(
+	uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
 void AuAA64SyscallHandler(AA64Registers* regs) {
 	mask_irqs();
 	uint64_t vector = regs->x16;
 	uint64_t retcode = 0;
+	uint64_t syscall_elr;
+	uint64_t syscall_spsr = read_spsr_el1();
+	__asm__ volatile("mrs %0, elr_el1" : "=r"(syscall_elr));
 
 	/* Musl puts the Linux number in x8. PE programs still use x16. */
 	{
@@ -301,7 +374,7 @@ void AuAA64SyscallHandler(AA64Registers* regs) {
 	PROFILE_START(syscall_name[vector]);
 skip_1:
 #endif
-	if ((vector > AURORA_MAX_SYSCALL) || (vector < 0)) {
+	if ((vector >= AURORA_MAX_SYSCALL) || (vector < 0)) {
 		regs->x0 = retcode;
 		return;
 	}
@@ -314,7 +387,7 @@ skip_1:
 	syscall_func func = (syscall_func)syscalls[vector];
 	if (!func) {
 		currThr->returnFromSyscall = 0;
-		regs->x0 = 0;
+		regs->x0 = (uint64_t)-AU_ERR_ENOSYS;
 
 #ifdef __KERNEL_PROFILER_ON__
 		if (syscall_name[vector] == 0)
@@ -332,6 +405,12 @@ skip_1:
 	AuSrvfsSyscallEnter(currThr);
 	retcode = func(regs->x0, regs->x1, regs->x2, regs->x3, regs->x4, regs->x5);
 	AuSrvfsSyscallExit(currThr);
+	/* A syscall may synchronously invoke a component that enables interrupts.
+	 * If an IRQ schedules the current thread while that component is running,
+	 * ELR_EL1 can retain the component's kernel PC instead of the user SVC
+	 * return address. Restore the entry PC before the exception return path. */
+	__asm__ volatile("msr elr_el1, %0" : : "r"(syscall_elr));
+	__asm__ volatile("msr spsr_el1, %0" : : "r"(syscall_spsr));
 	regs->x0 = retcode;
 	regs->x6 = retcode;
 	currThr->returnFromSyscall = 0;

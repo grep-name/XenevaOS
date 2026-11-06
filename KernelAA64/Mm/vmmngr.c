@@ -103,11 +103,18 @@ static uint64_t* vmm_get_leaf(uint64_t* root, uint64_t virt_addr) {
  * before its parent descriptor gets published. cleaning only the parent
  * PTE wouldve left stale contents sitting in a newly allocated child table
  * on non-coherent table walks --axiss */
-static void vmm_prepare_table(uint64_t page) {
-	void* table = (void*)P2V(page);
+static bool vmm_prepare_table(uint64_t page) {
+	void* table;
+	/* AuPmmngrAllocPage returns PMM_INVALID_PHYS when the free list is
+	 * empty. P2V of that value is FFFF7FFFFFFFFFFF, one byte under the
+	 * direct map, and memset of it is a kernel data abort. */
+	if (page == PMM_INVALID_PHYS)
+		return false;
+	table = (void*)P2V(page);
 	memset(table, 0, 4096);
 	aa64_data_cache_clean_range(table, 4096);
 	dsb_ish();
+	return true;
 }
 
 /**
@@ -158,7 +165,10 @@ bool AuMapPage(uint64_t phys_addr, uint64_t virt_addr, uint8_t attrib) {
 
 	if (!(pml4i[i4] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page)) {
+			UARTDebugOut("[vmm]: out of pages for L0 va=%x\r\n", virt_addr);
+			return false;
+		}
 		pml4i[i4] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE;
 		void* address = &pml4i[i4];
 		/* only this one 8-byte entry got dirtied, not the whole parent
@@ -171,7 +181,10 @@ bool AuMapPage(uint64_t phys_addr, uint64_t virt_addr, uint8_t attrib) {
 
 	if (!(pml3[i3] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page)) {
+			UARTDebugOut("[vmm]: out of pages for L1 va=%x\r\n", virt_addr);
+			return false;
+		}
 		pml3[i3] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE;
 		void* address = &pml3[i3];
 		/* same as the PML4 case above, only this entry is dirty --axiss */
@@ -193,7 +206,10 @@ bool AuMapPage(uint64_t phys_addr, uint64_t virt_addr, uint8_t attrib) {
 
 	if (!(pml2[i2] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page)) {
+			UARTDebugOut("[vmm]: out of pages for L2 va=%x\r\n", virt_addr);
+			return false;
+		}
 		pml2[i2] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE;
 		void* address = &pml2[i2];
 		/* same as the PML4 case above, only this entry is dirty --axiss */
@@ -258,7 +274,8 @@ bool AuMapPageEx(uint64_t* pml4i, uint64_t phys_addr, uint64_t virt_addr, uint8_
 
 	if (!(pml4i[i4] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return false;
 		pml4i[i4] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE | PTE_AF;
 		aa64_data_cache_clean_range(&pml4i[i4], sizeof(uint64_t));
 	}
@@ -266,7 +283,8 @@ bool AuMapPageEx(uint64_t* pml4i, uint64_t phys_addr, uint64_t virt_addr, uint8_
 
 	if (!(pml3[i3] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return false;
 		pml3[i3] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE | PTE_AF;
 		aa64_data_cache_clean_range(&pml3[i3], sizeof(uint64_t));
 	}
@@ -275,7 +293,8 @@ bool AuMapPageEx(uint64_t* pml4i, uint64_t phys_addr, uint64_t virt_addr, uint8_
 
 	if (!(pml2[i2] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return false;
 		pml2[i2] = (page & ~0xFFFUL) | PTE_VALID | PTE_TABLE | PTE_AF;
 		aa64_data_cache_clean_range(&pml2[i2], sizeof(uint64_t));
 	}
@@ -325,7 +344,8 @@ AuVPage* AuVmmngrGetPage(uint64_t virt_addr, uint8_t _flags, uint8_t mode) {
 
 	if (!(pml4i[i4] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return NULL;
 		pml4i[i4] = page | flags;
 		aa64_data_cache_clean_range(&pml4i[i4], sizeof(uint64_t));
 	}
@@ -333,7 +353,8 @@ AuVPage* AuVmmngrGetPage(uint64_t virt_addr, uint8_t _flags, uint8_t mode) {
 
 	if (!(pml3[i3] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return NULL;
 		pml3[i3] = page | flags;
 		aa64_data_cache_clean_range(&pml3[i3], sizeof(uint64_t));
 	}
@@ -342,7 +363,8 @@ AuVPage* AuVmmngrGetPage(uint64_t virt_addr, uint8_t _flags, uint8_t mode) {
 
 	if (!(pml2[i2] & 1)) {
 		const uint64_t page = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
-		vmm_prepare_table(page);
+		if (!vmm_prepare_table(page))
+			return NULL;
 		pml2[i2] = page | flags;
 		aa64_data_cache_clean_range(&pml2[i2], sizeof(uint64_t));
 	}
@@ -353,6 +375,8 @@ AuVPage* AuVmmngrGetPage(uint64_t virt_addr, uint8_t _flags, uint8_t mode) {
 	if (!(mode & VIRT_GETPAGE_CREATE))
 		return NULL;
 	uint64_t phys_addr = AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
+	if (phys_addr == PMM_INVALID_PHYS)
+		return NULL;
 	memset((void*)P2V(phys_addr), 0, PAGE_SIZE);
 	pml1[i1] = (phys_addr & VMM_PHYS_MASK) | flags;
 	data_cache_flush(&pml1[i1]);
@@ -628,4 +652,56 @@ void AuVmmngrBootFree() {
 
 	write_ttbr0_el1(_RootPaging);
 	tlb_flush_vmalle1is();
+}
+
+/**
+ * @brief AuVMmngrUserWalk -- user memory pte check function
+ * @param va -- virtual address
+ * @param write -- write bit
+ * @param span -- bytes from va to the end of mappings
+ */
+bool AuVmmngrUserWalk(uint64_t va, bool write, uint64_t* span) {
+#define PTE_APT_NOUSER (1ULL << 61)
+#define PTE_APT_RO	   (1ULL << 62)
+#define PTE_AP_USER	   (1ULL << 6)
+#define PTE_AP_RO	   (1ULL << 7)
+
+	uint64_t ttbr0;
+	__asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+
+	uint64_t* tbl = P2V(ttbr0 & 0x0000FFFFFFFFF000ULL);
+
+	for (int level = 0; level <= 3; level++) {
+		unsigned shift = 39 - 9 * level;
+		uint64_t pte = tbl[(va >> shift) & 0x1FF];
+
+		if (!(pte & PTE_VALID))
+			return false;
+
+		if (level < 3 && (pte & PTE_TABLE)) {
+			if (pte & PTE_APT_NOUSER)
+				return false;
+			if (write && (pte & PTE_APT_RO))
+				return false;
+			tbl = P2V(pte & 0x0000FFFFFFFFF000ULL);
+			continue;
+		}
+
+		if (level == 0)
+			return false;
+		if (level == 3 && !(pte & PTE_TABLE))
+			return false;
+
+		if (!(pte & PTE_AF))
+			return false;
+		if (!(pte & PTE_AP_USER))
+			return false;
+		if (write && (pte & PTE_AP_RO))
+			return false;
+
+		uint64_t size = 1ULL << shift;
+		*span = size - (va & (size - 1));
+		return true;
+	}
+	return false;
 }

@@ -32,6 +32,7 @@
 #include <Serv/sysserv.h>
 #include <Cap/capability.h>
 #include <Fs/vfs.h>
+#include <Fs/vdisk.h>
 #include <Fs/Fat/Fat.h>
 #include <Hal/AA64/sched.h>
 #include <process.h>
@@ -46,6 +47,10 @@
 #include <aucon.h>
 #include <Log/klog.h>
 #include <Fs/srvfs.h>
+#include <Fs/Dev/devfs.h>
+#include <bordoisila_ptr.h>
+#include <fixup.h>
+#include <Fs/vfsmod.h>
 
 extern uint64_t read_sp();
 extern uint64_t read_sp_el1();
@@ -83,6 +88,20 @@ int OpenFile(char* filename, int mode) {
 	int fd = AuProcessGetFileDesc(current_proc);
 	AuSrvfsNoteOpenMode(mode);
 	AuVFSNode* file = AuVFSOpen(fname);
+
+	uint8_t acc = 0;
+	if (mode & FILE_OPEN_READ_ONLY)
+		acc |= VFS_ACCESS_READ;
+	if (mode & FILE_OPEN_WRITE)
+		acc |= VFS_ACCESS_WRITE;
+	if (!acc)
+		acc = VFS_ACCESS_READ;
+
+	int want = 0;
+	if (acc & VFS_ACCESS_READ)
+		want |= 4;
+	if (acc & VFS_ACCESS_WRITE)
+		want |= 2;
 
 	/** check permissions before procedding **/
 	/* A write or create mode used to skip the permission check altogether, so any
@@ -134,6 +153,17 @@ int OpenFile(char* filename, int mode) {
 		UARTDebugOut("[fserv]: open '%s' failed: no free fd\r\n", fname);
 		return -1;
 	}
+	if ((file->flags & FS_FLAG_DEVICE) && !AuDevFSNodeOpen(file)) {
+		UARTDebugOut("[fserv]: open '%s' failed: device is unloading\r\n", fname);
+		return -1;
+	}
+
+	/** need to properly check, buggy */
+	if (!AuVFSCheckAccess(&current_proc->creds, file, want)) {
+		UARTDebugOut("[vfs]: opened failed bad file access modes \r\n");
+		//AuVFSNodeClose(fsys, file);
+		//return -1;
+	}
 
 	/* just to increase the reference count */
 	if (file->open)
@@ -153,6 +183,7 @@ int OpenFile(char* filename, int mode) {
 
 	BordoisilaCapCreate(current_proc, fd, file, CAP_OBJ_FILE, rights);
 
+	current_proc->access[fd] = acc;
 	//_setdebug = 1;
 	return fd;
 }
@@ -204,6 +235,13 @@ int FileSetOffset(int fd, size_t offset) {
  * @param length -- length in bytes
  */
 size_t ReadFile(int fd, void* buffer, size_t length) {
+	/** check for user mode buffer validity  */
+	if (!__BORDOISILA_UBUF_VALIDATE(buffer, length)) {
+		UARTDebugOut("[aurora]: Read file denied fd : %d, invalid buffer : %x \r\n", fd, buffer);
+		return 0;
+	}
+	/** also need to check access rights  */
+
 	if (fd < 0)
 		return 0;
 	if (!buffer)
@@ -266,6 +304,11 @@ size_t ReadFile(int fd, void* buffer, size_t length) {
  * @param length -- length in bytes
  */
 size_t WriteFile(int fd, void* buffer, size_t length) {
+	if (!__BORDOISILA_UBUF_VALIDATE(buffer, length)) {
+		BPrintK(
+			BORDOISILA_ERROR, "WriteFile denied, invalid buffer : %x , fd : %d \r\n", buffer, fd);
+		return 0;
+	}
 	if (fd < 0)
 		return 0;
 	if (!buffer)
@@ -305,7 +348,9 @@ size_t WriteFile(int fd, void* buffer, size_t length) {
 		size_t done = 0;
 		while (done < length) {
 			size_t chunk = length - done > PAGE_SIZE ? PAGE_SIZE : length - done;
-			size_t w = fsys->write ? fsys->write(fsys, file, (uint64_t*)(aligned_buffer + done), chunk) : 0;
+			size_t w = fsys->write
+						   ? fsys->write(fsys, file, (uint64_t*)(aligned_buffer + done), chunk)
+						   : 0;
 			if (!w)
 				break;
 			done += w;
@@ -332,7 +377,11 @@ size_t WriteFile(int fd, void* buffer, size_t length) {
 			size_t chunk = remaining > PAGE_SIZE ? PAGE_SIZE : remaining;
 			uint64_t* buff = (uint64_t*)P2V((size_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL));
 			memset(buff, 0, PAGE_SIZE);
-			memcpy(buff, src, chunk);
+			//memcpy(buff, src, chunk);
+			if (__bordoisila_copy_from_user(buff, aligned_buffer, chunk) != 0) {
+				AuPmmngrReleasePage((uint64_t)V2P((size_t)buff));
+				return remaining;
+			}
 			AuVFSNodeWrite(fsys, file, buff, chunk);
 			AuPmmngrReleasePage((uint64_t)V2P((size_t)buff));
 			src += chunk;
@@ -342,8 +391,17 @@ size_t WriteFile(int fd, void* buffer, size_t length) {
 	}
 
 	if (file->flags & FS_FLAG_TTY) {
+		uint64_t* ubuff = buffer;
+		uint8_t safe_ptr[1024];
+		memset(&safe_ptr, 0, 1024);
+
+		if (__bordoisila_copy_from_user(safe_ptr, ubuff, length) != 0)
+			return ret_bytes;
+
 		if (file->write)
-			return file->write(file, file, (uint64_t*)buffer, length);
+			ret_bytes = file->write(file, file, (uint64_t*)safe_ptr, length);
+
+		return ret_bytes;
 	}
 
 	if (file->flags & FS_FLAG_DEVICE) {
@@ -393,6 +451,19 @@ int CloseFile(int fd) {
 		BordoisilaCapDestroy(current_proc, fd);
 		return 0;
 	}
+	/* Device nodes are permanent and shared between every open, so the
+	 * node is never freed here -- but the close hook must still run: DCL
+	 * routes it to the module's release, and a DRM file's master lives
+	 * there. Without this, closing /dev/dri/cardN left the master set and
+	 * the next opener had every DRM_MASTER ioctl refused with -EACCES.
+	 * See AuProcessCloseFiles for the process-exit half. --axiss */
+	if (file->flags & FS_FLAG_DEVICE) {
+		current_proc->fds[fd] = 0;
+		BordoisilaCapDestroy(current_proc, fd);
+		if (file->close)
+			file->close(file, file);
+		return 0;
+	}
 	if (file->flags & FS_FLAG_GENERAL) {
 		current_proc->fds[fd] = 0;
 		BordoisilaCapDestroy(current_proc, fd);
@@ -425,6 +496,13 @@ int CloseFile(int fd) {
 			kfree(file);
 		else
 			file->fileCopyCount -= 1;
+		return 0;
+	}
+
+	if (file->flags & FS_FLAG_DEVICE) {
+		current_proc->fds[fd] = 0;
+		BordoisilaCapDestroy(current_proc, fd);
+		AuDevFSNodeClose(file);
 		return 0;
 	}
 
@@ -521,6 +599,26 @@ int FileStat(int fd, void* buf) {
 }
 
 /**
+ * @brief VFSMount -- attach a registered volume's file system at the
+ * mount point it reserved when the disk was first discovered
+ * @param name -- one-letter mount point
+ * @return 0 on success, -1 on failure
+ */
+int VFSMount(char* name) {
+	return AuVDiskMount(name);
+}
+
+/**
+ * @brief VFSUnmount -- flush a mounted volume and detach its file system
+ * from the VFS.  The mount letter stays reserved for a later mount.
+ * @param name -- one-letter mount point
+ * @return 0 on success, -1 on failure
+ */
+int VFSUnmount(char* name) {
+	return AuVDiskUnmount(name);
+}
+
+/**
  * @brief OpenDir -- opens a directory
  * @param filename -- name of the directory
  */
@@ -540,8 +638,29 @@ int OpenDir(char* filename) {
 	AuVFSNode* dirfile = NULL;
 	if (!fsys)
 		return -1;
+
+	char* path_to_open = filename;
+	if (strcmp(fsys->filename, "/") != 0) {
+		char* next = strchr(filename, '/');
+		if (next) {
+			next++;
+			char pathname[16];
+			int i = 0;
+			for (i = 0; i < 15; i++) {
+				if (next[i] == '/' || next[i] == '\0')
+					break;
+				pathname[i] = next[i];
+			}
+			pathname[i] = 0;
+			if (strcmp(fsys->filename, pathname) == 0) {
+				next += i;
+				path_to_open = (next[0] == '\0') ? "/" : next;
+			}
+		}
+	}
+
 	if (fsys->opendir)
-		dirfile = fsys->opendir(fsys, filename);
+		dirfile = fsys->opendir(fsys, path_to_open);
 
 	if (!dirfile)
 		return -1;
@@ -689,4 +808,53 @@ int CreateDir(char* filename) {
 	}
 
 	return -1;
+}
+
+/**
+ * @brief Chmod -- change a file mode
+ * @param filename -- name of the file
+ * @param mode -- mode value
+ */
+int Chmod(const char* pathname, unsigned int mode) {
+	if (!pathname)
+		return -1;
+
+	int pathlen = 4096;
+	char* kpath = kmalloc(pathlen);
+
+	long n = _bordoisila_strncpy_from_user(kpath, pathname, pathlen);
+	if (n < 0) {
+		kfree(kpath);
+		return -1;
+	} else if (n == 0) {
+		kfree(kpath);
+		return -1;
+	}
+
+	AuVFSNode* file = AuVFSOpen(kpath);
+	if (!file)
+		return -1;
+
+	AuVFSNode* fs = AuVFSFind(kpath);
+	if (!fs) {
+		kfree(file);
+		UARTDebugOut("[aurora-chmod]: file system not specified \r\n");
+		return -1;
+	}
+
+	int ret = AuVFSChmodNode(fs, file, mode);
+	if (ret < 0) {
+		kfree(file);
+		UARTDebugOut(
+			"[aurora-chmod]: failed to change mode of path : %s filename : %s, ret = %d \r\n",
+			kpath,
+			file->filename,
+			ret);
+		return -1;
+	}
+
+	UARTDebugOut("[aurora-chmod]: file mode changed successfully %s \r\n", file->filename);
+	kfree(kpath);
+	kfree(file);
+	return 0;
 }

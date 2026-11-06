@@ -52,6 +52,7 @@
 #include <Fs/Dev/devclip.h>
 #include <Fs/initrd.h>
 #include <Drivers/virtio.h>
+#include <Drivers/usb.h>
 #include <audrv.h>
 #include <Hal/AA64/sched.h>
 #include <Fs/tty.h>
@@ -72,6 +73,7 @@
 #include <Fs/Fat/FatDir.h>
 #include <Log/klog.h>
 #include <linux/module_loader.h>
+#include <fixup.h>
 
 extern void AuBtInitialize(void);
 
@@ -232,6 +234,11 @@ void _AuMain(KERNEL_BOOT_INFO* info) {
 	AuAA64BoardInitialize();
 	AuVFSInitialise();
 	AuInitrdInitialize(info);
+	/* Device nodes published by AuConsolePostInitialise (notably /dev/graph)
+	 * use the global group table.  Initialize it before those nodes are
+	 * created so user-space compositor and GPU services receive the same
+	 * world-group ID as their credentials. */
+	AuCredGroupInitialize();
 	AuConsolePostInitialise(info);
 	//AuConsoleBypassAuTextOut();
 
@@ -244,16 +251,10 @@ void _AuMain(KERNEL_BOOT_INFO* info) {
 	AuInitialiseSHMMan();
 	AuMmngrFileCacheInit();
 
-	/* initialize kernel credentials
-	 * note: untill here ensure no file gets opened
-	 * because file system may use credentials 
-	 */
-	AuCredGroupInitialize();
-
 	/* /dev/clipboard registers here rather than from devfs: its group comes
-	 * from the table above, which is empty until this line. Registering with
-	 * devfs gave the node group 0, and AuCredCheckPermissions admits only
-	 * root or a matching group, so no ordinary process could open it. */
+	 * from the initialized table. Registering with devfs before the group
+	 * table was ready gave the node group 0, and AuCredCheckPermissions admits
+	 * only root or a matching group, so no ordinary process could open it. */
 	AuDevClipInitialise();
 
 	/* initialize the network layer */
@@ -270,9 +271,18 @@ void _AuMain(KERNEL_BOOT_INFO* info) {
 #endif
 
 	/* initialize our basic requirement */
+#if defined(__TARGET_BOARD_QEMU_VIRT__) && !defined(__XENEVA_BYPASS_VIRTIO_INPUT__)
+	/* for qemu virt board, virtIO inputs are used.  On the vendored-input
+	 * build these PCI functions belong to DCL's virtio scan instead. */
+//	AuVirtIOInputInitialize();
+#endif
 #ifdef __TARGET_BOARD_QEMU_VIRT__
-	/* for qemu virt board, virtIO inputs are used */
-	AuVirtIOInputInitialize();
+	/* qemu-xhci is independent of the virtio input pair: it owns the
+	 * usb-kbd/usb-tablet devices on the same machine and delivers their
+	 * HID reports through the native /dev/kybrd and /dev/mice queues.
+	 * Enumeration runs here; AuXhciStartPolling() starts its threads after
+	 * the scheduler's thread list exists. */
+	AuXhciInitialize();
 #endif
 	/* required virtio-mouse and keyboard */
 	//Here goes board pre driver initialize
@@ -329,6 +339,9 @@ void _AuMain(KERNEL_BOOT_INFO* info) {
 	/* initialize the deodhai's communication protocol */
 	AuIPCPostBoxInitialise();
 
+	/* check the fixup table */
+	__bordoisila_fixup_table_check();
+
 #ifdef __TARGET_BOARD_IMX8MP_VERDIN_DAHLIA__
 	AuTextOut("[aurora]: Board model : Toradex imx8M Plus Verdin Dahlia (Xeneva Build %s - %s)\r\n",
 			  __DATE__,
@@ -350,7 +363,18 @@ void _AuMain(KERNEL_BOOT_INFO* info) {
 	UARTDebugOut("[aurora]: boot freed up \r\n");
 
 	AuSchedulerInitialize();
+
+#ifdef __TARGET_BOARD_QEMU_VIRT__
+	/* The controller is already enumerated. Starting the HID poll thread
+	 * here, after AuSchedulerInitialize(), ensures it survives the thread
+	 * list reset and receives CPU once the scheduler starts. */
+	AuXhciStartPolling();
+	/* QEMU virt always has UART1 (a null backend under --no-bt), and the
+	 * gate does not add a USB Bluetooth dongle. Bt/host.c probes UART1,
+	 * then the virtio-serial function, then falls back to the in-guest
+	 * mock controller, which publishes /dev/bt0. */
 	AuBtInitialize();
+#endif
 	//AuEDFSelfTestStart();
 #ifdef __XENEVA_SOAK__
 	AuSoakStart();

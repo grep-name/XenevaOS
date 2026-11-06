@@ -35,6 +35,7 @@
 #include <Mm/pmmngr.h>
 #include <Mm/vmmngr.h>
 #include <Mm/kmalloc.h>
+#include <Mm/mmfile.h>
 #include <aucon.h>
 #include <Fs/vfs.h>
 #include <pe.h>
@@ -45,6 +46,7 @@
 #include <_null.h>
 #include <Hal/AA64/profile.h>
 #include <timer.h>
+#include <Fs/vfsmod.h>
 
 #define LOADER_SCRATCH_VIRT 0xFFFFC00000700000
 
@@ -202,9 +204,12 @@ void AuLoaderMapExecFromCache(AuProcess* proc,
 							v_page,
 							PTE_USER_EXECUTABLE | PTE_AP_RW_USER | PTE_NORMAL_MEM);
 			}
+			if (((v_page >> 12) & 15) == 0)
+				AuSchedYieldMs(1);
 		}
 
-		/* Copy data from the scratch buffer to the mapped pages, handling boundaries */
+		/* Section bytes live in the file page cache. Scratch is only 1 MiB,
+		 * so a file offset past that window is not a valid kernel address. */
 		size_t bytes_to_copy = rawSize;
 		size_t current_vaddr = load_addr;
 		size_t current_file_offset = fileOffset;
@@ -218,13 +223,35 @@ void AuLoaderMapExecFromCache(AuProcess* proc,
 			void* phys = AuGetPhysicalAddressEx(proc->cr3, current_vaddr);
 			if (phys) {
 				void* dest = (void*)(P2V((size_t)phys) + page_offset);
-				void* src = (void*)((uint64_t)_ldr_scratchBuffer + current_file_offset);
-				memcpy(dest, src, bytes_in_this_page);
+				size_t left = bytes_in_this_page;
+				size_t dst_off = 0;
+				size_t src_off = current_file_offset;
+				while (left > 0) {
+					size_t src_page = src_off / PAGE_SIZE;
+					size_t src_poff = src_off % PAGE_SIZE;
+					size_t chunk = PAGE_SIZE - src_poff;
+					if (chunk > left)
+						chunk = left;
+					AuMMPageCache* cache = AuMmngrFileCacheGetByIndex(fb, src_page);
+					if (!cache) {
+						UARTDebugOut("[loader]: missing page cache at %x\r\n", src_off);
+						memset((uint8_t*)dest + dst_off, 0, chunk);
+					} else {
+						memcpy((uint8_t*)dest + dst_off,
+							   (uint8_t*)P2V(cache->physicalPage) + src_poff,
+							   chunk);
+					}
+					dst_off += chunk;
+					src_off += chunk;
+					left -= chunk;
+				}
 			}
 
 			current_vaddr += bytes_in_this_page;
 			current_file_offset += bytes_in_this_page;
 			bytes_to_copy -= bytes_in_this_page;
+			if (((current_vaddr >> 12) & 15) == 0)
+				AuSchedYieldMs(1);
 		}
 	}
 }
@@ -248,7 +275,8 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 	char* v_ = strchr(filename, '.');
 	if (v_)
 		v_++;
-	if (strcmp(v_, "exe") != 0 && strcmp(v_, "elf") != 0) {
+	if (strcmp(v_, "exe") != 0 && strcmp(v_, "EXE") != 0 &&
+		strcmp(v_, "elf") != 0 && strcmp(v_, "ELF") != 0) {
 		UARTDebugOut("[aurora]: non-executable process \r\n");
 		return -1;
 	}
@@ -280,6 +308,15 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 		UARTDebugOut("No File found -> %s \r\n", filename);
 		return -1;
 	}
+
+	if (file->flags & FS_FLAG_DIRECTORY)
+		return -1;
+
+	if (!AuVFSCheckAccess(&proc->creds, file, 1 /* execute bit */)) {
+		UARTDebugOut("[loader]: %s : permission denied, file mode incorrect \r\n", filename);
+		return -1;
+	}
+
 	size_t scratch_bytes = 0;
 
 	if (file->eof == 1 && fb->readComplete == 1)
@@ -287,6 +324,7 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 
 	if (fb->readComplete == false) {
 		size_t file_offset = 0;
+		size_t yield_mark = 0;
 		int elf_file = 0;
 		const size_t scratch_limit = 1024 * 1024;
 		while (file->eof != 1) {
@@ -308,15 +346,23 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 				if (mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F')
 					elf_file = 1;
 			}
+			/* The whole load is one syscall, and syscall entry masks IRQs.
+			 * Reading netsurf.exe straight through froze the desktop until
+			 * the last block. Hand the compositor a tick every 64KB. */
+			if (file_offset - yield_mark >= (64 * 1024)) {
+				yield_mark = file_offset;
+				AuSchedYieldMs(1);
+			}
 		}
 
 		size_t scratch_filled = file_offset;
 		if (scratch_filled > scratch_limit)
 			scratch_filled = scratch_limit;
 
-		size_t total_pages =
-			scratch_filled / PAGE_SIZE + ((scratch_filled % PAGE_SIZE) ? 1 : 0);
+		size_t total_pages = scratch_filled / PAGE_SIZE + ((scratch_filled % PAGE_SIZE) ? 1 : 0);
 		for (size_t i = 0; i < total_pages; i++) {
+			if ((i & 15) == 0)
+				AuSchedYieldMs(1);
 			uint64_t physcache = (uint64_t)AuPmmngrAllocPage(AURORA_PAGE_NORMAL);
 			AuMMPageCache* cache = AuMmngrPageCacheCreate();
 			cache->physicalPage = physcache;
@@ -333,11 +379,11 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 				   copy_sz);
 		}
 
-		/* ELF past the scratch window: one block at a time into page cache. */
-		if (elf_file && file->eof != 1) {
+		/* Anything past the scratch window goes into the page cache.
+		 * PE images such as netsurf.exe are larger than 1 MiB too. */
+		if (file->eof != 1) {
 			while (file->eof != 1) {
-				size_t bytes_read =
-					AuVFSNodeReadBlock(fsys, file, (uint64_t*)_ldr_scratchBuffer);
+				size_t bytes_read = AuVFSNodeReadBlock(fsys, file, (uint64_t*)_ldr_scratchBuffer);
 				if (bytes_read == 0)
 					break;
 				size_t copied = 0;
@@ -365,6 +411,10 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 					copied += chunk;
 				}
 				file_offset += bytes_read;
+				if (file_offset - yield_mark >= (64 * 1024)) {
+					yield_mark = file_offset;
+					AuSchedYieldMs(1);
+				}
 			}
 		}
 
@@ -413,6 +463,18 @@ int AuLoadExecToProcess(AuProcess* proc, char* filename, int argc, char** argv) 
 		PROFILE_END("AuLoadExecToProcess");
 #endif
 		return elf_rc;
+	}
+
+	/* The tail read reuses scratch from offset 0. Put the first 1 MiB
+	 * back so the DOS/NT headers and the dynamic-link check stay valid. */
+	if (fb->pageCache) {
+		for (AuMMPageCache* page = fb->pageCache; page; page = page->next) {
+			if (page->pageIndex >= (1024 * 1024) / PAGE_SIZE)
+				continue;
+			memcpy((void*)((uint64_t)_ldr_scratchBuffer + page->pageIndex * PAGE_SIZE),
+				   (void*)P2V(page->physicalPage),
+				   PAGE_SIZE);
+		}
 	}
 
 	IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)_ldr_scratchBuffer;

@@ -107,6 +107,7 @@ static void ChOnGridVScroll(ChWidget* widget, ChWindow* win, int currentVal, uin
 	ChScrollBar* sb = (ChScrollBar*)widget;
 	ChGridView* gv = (ChGridView*)sb->attachedTo;
 	gv->scroll_y = currentVal;
+	gv->force_full_redraw = true;
 	_reposition_child(gv);
 }
 
@@ -316,7 +317,7 @@ static void _grid_draw_range(ChGridView* gv, ChWindow* win, int clip_y, int clip
 }
 
 static void _draw_single_cell(ChGridView* gv, ChWindow* win, int index, ChRect* out_rect) {
-	if (index < 0 || index >= gv->cell_count)
+	if (!gv || !gv->wid.visible || index < 0 || index >= gv->cell_count)
 		return;
 
 	int row = index / gv->columns;
@@ -385,6 +386,8 @@ static void _draw_single_cell(ChGridView* gv, ChWindow* win, int index, ChRect* 
 
 void ChGridViewDraw(ChWidget* wid, ChWindow* win) {
 	ChGridView* gv = (ChGridView*)wid;
+	if (!gv || !gv->wid.visible)
+		return;
 	int delta_y = gv->scroll_y - gv->prev_scroll_y;
 
 	int full_redraw =
@@ -466,12 +469,56 @@ static int is_over_vscrollbar(ChGridView* gv, ChWindow* win, int mx, int my) {
 
 void ChGridViewMouseEvent(ChWidget* wid, ChWindow* win, int mx, int my, int button) {
 	ChGridView* gv = (ChGridView*)wid;
+	if (!gv || !gv->wid.visible)
+		return;
 	uint8_t was_down = gv->prev_button;
 	uint8_t is_down = (button != 0);
 
+	// Mouse wheel scrolling
+	if (button == DEODHAI_MOUSE_MSG_SCROLL_UP) {
+		int old_scroll = gv->scroll_y;
+		int step = (gv->cell_h + gv->cell_padding);
+		if (step < 30) step = 30;
+		gv->scroll_y -= step;
+		if (gv->scroll_y < 0)
+			gv->scroll_y = 0;
+		if (gv->scroll_y != old_scroll) {
+			_reposition_child(gv);
+			gv->force_full_redraw = true;
+			ChScrollBarSetValue(&gv->vscroll, gv->scroll_y);
+			ChGridViewDraw(wid, win);
+			ChWindowUpdate(win, gv->wid.x, gv->wid.y, gv->wid.w, gv->wid.h, 0, 1);
+		}
+		return;
+	} else if (button == DEODHAI_MOUSE_MSG_SCROLL_DOWN) {
+		int max_scroll = gv->content_height - gv->viewport_height;
+		if (max_scroll < 0) max_scroll = 0;
+		int old_scroll = gv->scroll_y;
+		int step = (gv->cell_h + gv->cell_padding);
+		if (step < 30) step = 30;
+		gv->scroll_y += step;
+		if (gv->scroll_y > max_scroll)
+			gv->scroll_y = max_scroll;
+		if (gv->scroll_y != old_scroll) {
+			_reposition_child(gv);
+			gv->force_full_redraw = true;
+			ChScrollBarSetValue(&gv->vscroll, gv->scroll_y);
+			ChGridViewDraw(wid, win);
+			ChWindowUpdate(win, gv->wid.x, gv->wid.y, gv->wid.w, gv->wid.h, 0, 1);
+		}
+		return;
+	}
+
 	if (is_over_vscrollbar(gv, win, mx, my) || gv->vscroll.state == SB_STATE_DRAGGING) {
+		if (button != 0) {
+			win->focusedWidget = (void*)wid;
+		} else {
+			if (win->focusedWidget == (void*)wid)
+				win->focusedWidget = NULL;
+		}
 		if (gv->vscroll.base.ChMouseEvent)
 			gv->vscroll.base.ChMouseEvent((ChWidget*)&gv->vscroll, win, mx, my, button);
+		gv->force_full_redraw = true;
 		ChGridViewDraw(wid, win);
 		ChWindowUpdate(win, gv->wid.x, gv->wid.y, gv->wid.w, gv->wid.h, 0, 1);
 		return;
@@ -485,14 +532,18 @@ void ChGridViewMouseEvent(ChWidget* wid, ChWindow* win, int mx, int my, int butt
 	}
 
 	if (!was_down && is_down) {
-		if (index != -1 && index != gv->selected_index) {
+		if (index != -1) {
 			int old_selected = gv->selected_index;
 			gv->selected_index = index;
-			//call gv->onselect event
+			if (gv->OnSelect)
+				gv->OnSelect(gv, win, index, &gv->cells[index]);
+			if (!gv->wid.visible) {
+				gv->prev_button = is_down;
+				return;
+			}
 			gv->force_full_redraw = true;
-			//	ChGridViewDraw(wid, win);
 			ChRect dirty;
-			if (old_selected != 1) {
+			if (old_selected != -1 && old_selected != index) {
 				_draw_single_cell(gv, win, old_selected, &dirty);
 				ChWindowUpdate(win, dirty.x, dirty.y, dirty.w, dirty.h, 0, 1);
 			}

@@ -82,3 +82,6 @@ EXPORTS
     _KeExitSubThread
     _KeSendSignalToThread
     _KeThreadWaitForTermination
+    uname
+    poll
+    chmod
