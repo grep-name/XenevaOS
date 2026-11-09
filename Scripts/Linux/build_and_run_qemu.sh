@@ -29,7 +29,7 @@ set -e
 #                           resident (no drvctl unload, no user-space servers).
 #   --openxr                DeodhaiXR emits OpenXR (QEMU SBS runtime). Pair with
 #                           Tools/xeneva-xr-view and WiVRn for Quest 2.
-#   -xr-demo, --xr-demo     Open the modular XR demo TUI. Defaults enable EGL,
+#   -xr-demo, --xr-demo     Open the modular XR demo TUI. Defaults enable ,
 #                           hand pointer, controllers, both-hand mesh, and
 #                           automatic 1024x768 boot. Needs WiVRn + Quest 2.
 #   --xr-demo-defaults      Run that recommended XR profile without a TUI.
@@ -43,6 +43,10 @@ set -e
 #   --xr-[no-]telnet        Enable/disable optional localhost HMP monitor.
 #   --egl-headless          QEMU -display egl-headless + dbus (DMA-BUF scanout).
 #                           Use Tools/xeneva-xr-view --desktop --egl to steal frames.
+#   --virgl                 Use virtio-gpu-gl-pci (virgl 3D) with a GL display
+#                           (gtk,gl=on, or egl-headless). Host needs QEMU built
+#                           with virglrenderer. VREND_DEBUG=err,cmd in the host
+#                           environment logs rejected 3D command streams.
 #   --tui                   Open an interactive text menu to pick toolchain,
 #                           profile, run mode and guest options, then continue
 #                           into the normal build/run flow. Needs a terminal;
@@ -139,6 +143,7 @@ OPENXR=0
 XR_DEMO=0
 XR_DEMO_MENU=0
 EGL_HEADLESS=0
+VIRGL=0
 XR_HANDS=1
 XR_CONTROLLERS=1
 # The viewer is pinned to WiVRn's GPU, so its hand swapchains share the same
@@ -502,6 +507,7 @@ while [ $# -gt 0 ]; do
 		--xr-telnet) XR_TELNET=1 ;;
 		--xr-no-telnet) XR_TELNET=0 ;;
 		--egl-headless) EGL_HEADLESS=1 ;;
+        --virgl) VIRGL=1 ;;
         --force-legacy-build) FORCE_LEGACY_BUILD=1 ;;
         --install-deps) INSTALL_DEPS=1 ;;
         --headless) HEADLESS=1 ;;
@@ -818,6 +824,12 @@ fi
 if [ "$HEADLESS" -eq 1 ] && [ "$EGL_HEADLESS" -eq 1 ]; then
 	printf "${STY_RED}[$0]: --headless and --egl-headless are mutually exclusive.${STY_RST}\n"
 	exit 1
+fi
+
+# virtio-gpu-gl needs an OpenGL-capable GPU, -display has none somehow 🫠
+if ["$VIRGL" -eq 1 ] && ["$HEADLESS" -eq 1]; then
+    printf "${STY_RED}[$0]: --virtgl needs a GL display: use --egl-headless instead of --headless. ${STY_RST}\n"
+    exit 1
 fi
 
 requested_userspace_profile="${TOOLCHAIN}-normal"
@@ -1245,6 +1257,13 @@ if ! qemu-system-aarch64 -audiodev help 2>&1 | grep -qw 'pa'; then
     echo "[+] Audio: this QEMU has no 'pa' backend, using 'none' (silent guest sound)."
 fi
 
+# --vrigl swaps in the GL variant of virtio-gpu
+GPU_DEVICE="virtio-gpu-pci,disable-legacy=on,id=gpu0"
+if [ "$VIRGL" -eq 1 ]; then
+    GPU_DEVICE="virtio-gpu-gl-pci,disable-legacy=on,id=gpu0"
+    echo "[+] virgl: using virtio-gpu-gl-pci (3D)"
+fi
+
 NET_DEVICE="virtio-net-pci,netdev=net0"
 case "${NETSRV:-0}" in
     0|'') ;;
@@ -1268,7 +1287,7 @@ QEMU_ARGS=(
     -monitor unix:/tmp/xeneva-mon.sock,server,nowait
     # Register virtio-gpu first so QEMU's VNC server follows the display the
     # Xeneva compositor drives after boot. ramfb remains as a fallback GOP.
-    -device virtio-gpu-pci,disable-legacy=on,id=gpu0
+    -device "$GPU_DEVICE"
     -device ramfb,id=ramfb
     -device virtio-keyboard-pci
     -device virtio-tablet-pci
@@ -1581,7 +1600,12 @@ else
     else
         # Keep both ramfb (boot/GOP) and virtio-gpu visible. The compositor
         # moves to the second display after boot, while ramfb goes black. --axiss
-        QEMU_ARGS+=(-display gtk,zoom-to-fit=on,show-tabs=on)
+        if [ "$VIRGL" -eq 1 ]; then
+            QEMU_ARGS+=(-display gtk,gl=on,zoom-to-fit=on,show-tabs=on)
+        else
+            QEMU_ARGS+=(-display gtk,zoom-to-fit=on,show-tabs=on)
+        fi
+
         qemu-system-aarch64 "${QEMU_ARGS[@]}"
     fi
 fi
